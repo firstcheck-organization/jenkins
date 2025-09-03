@@ -1,90 +1,116 @@
 pipeline {
-    agent any
-    
+    agent { label 'agent1' }
+
     environment {
-        JAR_FILE = "java-sample-21-1.0.0.jar"
-        APP_PORT = '5000'
+        AWS_REGION = 'ap-south-1'
+        AWS_ACCOUNT_ID = '339759183788'
+        ECR_REPO = 'for-java-app'
+        IMAGE_TAG = 'latest'
+        ECR_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
     }
-    
-    // tools {
-    //     maven 'Maven-3.9.0'
-    //     jdk 'JDK-21'
-    // }
-    
+
     stages {
         stage('Checkout') {
             steps {
-                echo '🔄 Checking out source code...'
-                git branch: 'master', url: 'https://github.com/artisantek/jenkins.git'
+                git url: 'https://github.com/firstcheck-organization/jenkins.git'
             }
         }
-        
-        stage('Test') {
-            steps {
-                echo '🧪 Running unit tests...'
-                dir('javaapp-pipeline') {
-                    sh '''
-                        echo "Starting test execution..."
-                        mvn clean test
-                    '''
-                }
-            }
-        }
-        
+
         stage('Build') {
             steps {
-                echo '🏗️ Building application...'
+                dir('javaapp-pipeline') {
+                    sh 'mvn clean package'
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                dir('javaapp-pipeline') {
+                    sh 'mvn clean test'
+                }
+            }
+        }
+
+        stage('Trivy FS Scan') {
+            steps {
                 dir('javaapp-pipeline') {
                     sh '''
-                        echo "Building JAR file..."
-                        mvn clean package -DskipTests=true
+                        wget -q https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -O html.tpl
+                        trivy fs --format template --template "@html.tpl" -o report.html .
                     '''
                 }
             }
         }
-        
-        stage('Deploy') {
+
+        stage('Sonar Analysis') {
             steps {
-                echo '🚀 Deploying application...'
-                dir('javaapp-pipeline/target') {
-                    script {
-                        // Stop any existing application process
+                dir('javaapp-pipeline') {
+                    withSonarQubeEnv('sonar') {
                         sh '''
-                            echo "🛑 Stopping any existing application processes..."
-                            if pgrep -f "java -jar java-sample-21-1.0.0.jar" > /dev/null; then
-                                pkill -f "java -jar java-sample-21-1.0.0.jar"
-                                echo "App was running and has been killed."
-                            else
-                                echo "App is not running."
-                            fi
-                        '''
-                        
-                        // Deploy the new application
-                        sh '''
-                            # Set JENKINS_NODE_COOKIE to prevent Jenkins from killing the process
-                            export JENKINS_NODE_COOKIE=dontKillMe
-                            
-                            # Start the application in background
-                            echo "Starting application on port ${APP_PORT}..."
-                            nohup java -jar "${JAR_FILE}" > application.log 2>&1 &
+                            mvn verify sonar:sonar \
+                            -Dsonar.projectKey=java-app \
+                            -Dsonar.projectName=java-app 
                         '''
                     }
                 }
             }
         }
+
+        stage('Build Docker Image') {
+            steps {
+                dir('javaapp-pipeline') {
+                    sh 'docker build -t javaapp .'
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh 'trivy image javaapp'
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh '''
+                    echo "🔐 Logging in to Amazon ECR..."
+                    aws ecr get-login-password --region $AWS_REGION | \
+                    docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+                    echo "🏷️ Tagging Docker image..."
+                    docker tag javaapp:latest $ECR_URI
+
+                    echo "📤 Pushing image to ECR..."
+                    docker push $ECR_URI
+                '''
+            }
+        }
+
+        stage('Deploy from ECR') {
+            steps {
+                sh '''
+                    echo "🔐 Logging in to Amazon ECR..."
+                    aws ecr get-login-password --region $AWS_REGION | \
+                    docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+                    echo "⬇️ Pulling image from ECR..."
+                    docker pull $ECR_URI
+
+                    echo "🚀 Running container from ECR image..."
+
+                    # Stop and remove existing container if it exists
+                    docker rm -f javaapp-container || true
+
+                    # Run the container on port 5000
+                    docker run -d \
+                        --name javaapp-container \
+                        -p 5000:5000 \
+                        $ECR_URI
+
+                    echo "✅ Container is running at http://localhost:5000"
+                '''
+            }
+        }
     }
-    
-    post {
-        always {
-            cleanWs()
-        }
-        success {
-            echo '🎉 Pipeline completed successfully!'
-        }
-        failure {
-            emailext subject: "Pipeline Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
-                     body: "Build failed. Please check the logs at ${env.BUILD_URL}",
-                     to: "artisantek.adithya@gmail.com"
-        }
-    }
-} 
+}
